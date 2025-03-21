@@ -1,0 +1,28 @@
+model:
+  vocab_size: 65  # Will be overridden by actual vocab size from data
+  n_embed: 64
+  num_heads: 4
+  n_layer: 2
+  max_seq_length: 32
+  dropout: 0.1
+
+training:
+  batch_size: 4
+  sequence_length: 8
+  learning_rate: 3e-4
+  max_steps: 10  # Number of training steps to run
+  eval_interval: 2
+  val_samples: 16
+  device: "cuda"  # Will be overridden if CUDA is not available
+  seed: 42
+  train_split: 0.9
+  distributed: false
+  world_size: 1
+  wandb:
+    project: "char-gpt-debug"
+    name: "debug"
+    log_interval: 1
+  checkpoint:
+    save_interval: 5
+    save_dir: "checkpoints/debug"
+    max_keep: 2 
