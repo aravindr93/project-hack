@@ -26,6 +26,6 @@ training:
     log_interval: 100
   # Checkpointing settings
   checkpoint:
-    save_interval: 1000
+    save_interval: 250
     save_dir: "checkpoints"
     max_keep: 3  # Maximum number of checkpoints to keep

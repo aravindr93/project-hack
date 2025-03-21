@@ -237,6 +237,7 @@ def train(config: Dict[str, Any]) -> None:
         
         # Checkpointing at specified intervals
         if step % config["training"]["checkpoint"]["save_interval"] == 0 and step > 0:
+            # Save checkpoint
             save_checkpoint(
                 model,
                 optimizer,
@@ -244,6 +245,24 @@ def train(config: Dict[str, Any]) -> None:
                 config,
                 config["training"]["checkpoint"]["save_dir"]
             )
+            
+            # Generate and log text sample
+            if not config["training"]["distributed"] or dist.get_rank() == 0:
+                # Get the underlying model if using DDP
+                model_to_generate = model.module if isinstance(model, DDP) else model
+                model_to_generate.eval()
+                with torch.no_grad():
+                    # Initialize with newline character
+                    context = torch.tensor([[ord('\n')]], dtype=torch.long, device=config["training"]["device"])
+                    # Generate text
+                    generated = model_to_generate.generate(context, max_new_tokens=200, temperature=0.8)
+                    generated_text = decode(generated[0].tolist())
+                    # Log to wandb
+                    wandb.log({
+                        'generation/text': wandb.Html(f'<pre>{generated_text}</pre>'),
+                        'generation/step': step
+                    })
+                model_to_generate.train()
     
     # Cleanup
     cleanup_distributed()
