@@ -7,6 +7,7 @@ import os
 import torch
 import torch.nn as nn
 import torch.distributed as dist
+import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 import wandb
@@ -24,43 +25,32 @@ def generate_run_id() -> str:
     """Generate a random run ID for wandb logging."""
     return f"chargpt-run-{uuid.uuid4().hex[:8]}"
 
-def setup_distributed(config: Dict[str, Any]) -> None:
-    """Initialize distributed training."""
-    if config["training"]["distributed"]:
-        # Override world_size based on actual GPUs
-        num_gpus = torch.cuda.device_count()
-        if num_gpus > 0:
-            config["training"]["world_size"] = num_gpus
-        else:
-            print("No GPUs found, falling back to CPU")
-            config["training"]["device"] = "cpu"
-            config["training"]["distributed"] = False
-            return
-            
-        # Set up environment variables for distributed training
-        os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = "12355"
-        os.environ["RANK"] = "0"
-        os.environ["WORLD_SIZE"] = str(config["training"]["world_size"])
-        os.environ["LOCAL_RANK"] = "0"
-        
-        # Initialize distributed training
-        dist.init_process_group("nccl")
-        torch.cuda.set_device(dist.get_rank())
+def setup(rank: int, world_size: int) -> None:
+    """Initialize distributed training process group."""
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "12355"
+    
+    # Initialize process group with gloo backend
+    dist.init_process_group(
+        backend="gloo",
+        init_method="env://",
+        world_size=world_size,
+        rank=rank
+    )
 
 def cleanup_distributed() -> None:
     """Clean up distributed training."""
     if dist.is_initialized():
         dist.destroy_process_group()
 
-def get_model(config: Dict[str, Any], vocab_size: int) -> nn.Module:
+def get_model(config: Dict[str, Any], vocab_size: int, rank: int) -> nn.Module:
     """Create and initialize the model."""
     config["model"]["vocab_size"] = vocab_size
     model = CharGPT.from_config(ModelConfig.from_dict(config))
     
     if config["training"]["distributed"]:
-        model = model.to(dist.get_rank())
-        model = DDP(model, device_ids=[dist.get_rank()])
+        model = model.to(rank)
+        model = DDP(model, device_ids=[rank])
     else:
         model = model.to(config["training"]["device"])
     
@@ -152,20 +142,19 @@ def evaluate(
     model.train()
     return loss.item()
 
-def train(config: Dict[str, Any]) -> None:
-    """Main training loop.
+def train_process(rank: int, world_size: int, config: Dict[str, Any]) -> None:
+    """Training process for each GPU."""
+    # Initialize process group
+    setup(rank, world_size)
     
-    Args:
-        config: Dictionary containing training configuration
-    """
-    # Set up distributed training
-    setup_distributed(config)
-
+    # Set device
+    torch.cuda.set_device(rank)
+    
     # Generate run ID and override wandb name in config
     config["training"]["wandb"]["name"] = generate_run_id()
     
-    # Initialize wandb
-    if not config["training"]["distributed"] or dist.get_rank() == 0:
+    # Initialize wandb only on main process
+    if rank == 0:
         wandb.init(
             project=config["training"]["wandb"]["project"],
             name=config["training"]["wandb"]["name"],
@@ -179,20 +168,20 @@ def train(config: Dict[str, Any]) -> None:
     )
     
     # Create model and optimizer
-    model = get_model(config, vocab_size=len(set(train_data)))
+    model = get_model(config, vocab_size=len(set(train_data)), rank=rank)
     optimizer = get_optimizer(model, config)
     
     # Training loop
     start_time = time.time()
     
     # Create progress bar only on main process
-    if not config["training"]["distributed"] or dist.get_rank() == 0:
+    if rank == 0:
         pbar = tqdm(range(config["training"]["max_steps"]), desc="Training")
     else:
         pbar = range(config["training"]["max_steps"])
     
     # Set random seed for reproducibility
-    torch.manual_seed(config["training"]["seed"])
+    torch.manual_seed(config["training"]["seed"] + rank)
 
     for step in pbar:
         # Get batch
@@ -201,7 +190,7 @@ def train(config: Dict[str, Any]) -> None:
             batch_size=config["training"]["batch_size"],
             sequence_length=config["training"]["sequence_length"],
             encode=encode,
-            device=config["training"]["device"]
+            device=f"cuda:{rank}" if torch.cuda.is_available() else "cpu"
         )
         
         # Forward pass
@@ -213,31 +202,28 @@ def train(config: Dict[str, Any]) -> None:
         optimizer.step()
         
         # Update progress bar
-        if not config["training"]["distributed"] or dist.get_rank() == 0:
+        if rank == 0:
             pbar.set_postfix({'loss': f'{loss.item():.4f}'})
         
         # Logging
-        if step % config["training"]["wandb"]["log_interval"] == 0:
-            if not config["training"]["distributed"] or dist.get_rank() == 0:
-                wandb.log({
-                    'train/loss': loss.item(),
-                    'train/step': step,
-                    'train/lr': optimizer.param_groups[0]['lr'],
-                    'train/time': time.time() - start_time
-                })
+        if step % config["training"]["wandb"]["log_interval"] == 0 and rank == 0:
+            wandb.log({
+                'train/loss': loss.item(),
+                'train/step': step,
+                'train/lr': optimizer.param_groups[0]['lr'],
+                'train/time': time.time() - start_time
+            })
         
         # Evaluation
-        if step % config["training"]["eval_interval"] == 0 and step > 0:
+        if step % config["training"]["eval_interval"] == 0 and step > 0 and rank == 0:
             val_loss = evaluate(model, val_data, config, encode, config["training"]["val_samples"])
-            if not config["training"]["distributed"] or dist.get_rank() == 0:
-                wandb.log({
-                    'val/loss': val_loss,
-                    'val/step': step
-                })
+            wandb.log({
+                'val/loss': val_loss,
+                'val/step': step
+            })
         
         # Checkpointing at specified intervals
-        if step % config["training"]["checkpoint"]["save_interval"] == 0 and step > 0:
-            # Save checkpoint
+        if step % config["training"]["checkpoint"]["save_interval"] == 0 and step > 0 and rank == 0:
             save_checkpoint(
                 model,
                 optimizer,
@@ -245,29 +231,40 @@ def train(config: Dict[str, Any]) -> None:
                 config,
                 config["training"]["checkpoint"]["save_dir"]
             )
-            
             # Generate and log text sample
-            if not config["training"]["distributed"] or dist.get_rank() == 0:
-                # Get the underlying model if using DDP
-                model_to_generate = model.module if isinstance(model, DDP) else model
-                model_to_generate.eval()
-                with torch.no_grad():
-                    # Initialize with newline character
-                    context = torch.tensor([[ord('\n')]], dtype=torch.long, device=config["training"]["device"])
-                    # Generate text
-                    generated = model_to_generate.generate(context, max_new_tokens=200, temperature=0.8)
-                    generated_text = decode(generated[0].tolist())
-                    # Log to wandb
-                    wandb.log({
-                        'generation/text': wandb.Html(f'<pre>{generated_text}</pre>'),
-                        'generation/step': step
-                    })
-                model_to_generate.train()
+            model_to_generate = model.module if isinstance(model, DDP) else model
+            model_to_generate.eval()
+            with torch.no_grad():
+                # Initialize with newline character
+                context = torch.tensor([[ord('\n')]], dtype=torch.long, device=config["training"]["device"])
+                # Generate text
+                generated = model_to_generate.generate(context, max_new_tokens=200, temperature=0.8)
+                generated_text = decode(generated[0].tolist())
+                # Log to wandb
+                wandb.log({
+                    'generation/text': wandb.Html(f'<pre>{generated_text}</pre>'),
+                    'generation/step': step
+                })
+            model_to_generate.train()
     
-    # Cleanup
     cleanup_distributed()
-    if not config["training"]["distributed"] or dist.get_rank() == 0:
-        wandb.finish()
+
+def train(config: Dict[str, Any]) -> None:
+    """Main training function that spawns processes for distributed training."""
+    if config["training"]["distributed"]:
+        num_gpus = torch.cuda.device_count()
+        config["training"]["world_size"] = min(config["training"]["world_size"], num_gpus)
+        world_size = config["training"]["world_size"]
+        if world_size > 0:
+            mp.spawn(
+                train_process,
+                args=(world_size, config),
+                nprocs=world_size,
+                join=True
+            )
+    else:
+        # Single GPU or CPU training
+        train_process(0, 1, config)
 
 def test_training():
     """Test the training loop with a small number of steps."""
